@@ -1,6 +1,7 @@
 config BLK_DEV_NVME
 	tristate "NVM Express block device"
-	depends on PCI && BLOCK
+	# depends on PCI && BLOCK
+	default N
 	---help---
 	  The NVM Express driver is for solid state drives directly
 	  connected to the PCI or PCI Express bus.  If you know you

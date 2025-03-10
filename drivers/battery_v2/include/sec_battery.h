@@ -118,10 +118,10 @@
 
 #define BATT_MISC_EVENT_UNDEFINED_RANGE_TYPE	0x00000001
 #define BATT_MISC_EVENT_WIRELESS_BACKPACK_TYPE	0x00000002
-#define BATT_MISC_EVENT_TIMEOUT_OPEN_TYPE	0x00000004
-#define BATT_MISC_EVENT_BATT_RESET_SOC		0x00000008
-#define BATT_MISC_EVENT_HICCUP_TYPE		0x00000020
-#define BATT_MISC_EVENT_FULL_CAPACITY		0x01000000
+#define BATT_MISC_EVENT_TIMEOUT_OPEN_TYPE		0x00000004
+#define BATT_MISC_EVENT_BATT_RESET_SOC			0x00000008
+#define BATT_MISC_EVENT_HICCUP_TYPE				0x00000020
+#define BATT_MISC_EVENT_FULL_CAPACITY			0X01000000
 
 #define SEC_INPUT_VOLTAGE_5V	5
 #define SEC_INPUT_VOLTAGE_9V	9
@@ -414,10 +414,6 @@ struct sec_battery_info {
 	bool store_mode;
 	bool slate_mode;
 
-	/* charging disabler */
-	bool charging_enabled;
-	bool charging_suspended;
-
 	/* usb suspend */
 	bool usb_suspend_mode;
 
@@ -477,6 +473,8 @@ struct sec_battery_info {
 	int fg_reset;
 
 	int batt_full_capacity;
+
+	bool usb_slow_chg;
 
 	bool block_water_event;
 
@@ -542,7 +540,6 @@ enum {
 
 	BATT_VF_ADC,
 	BATT_SLATE_MODE,
-	CHARGING_ENABLED,
 
 	BATT_LP_CHARGING,
 	SIOP_ACTIVATED,
@@ -681,6 +678,7 @@ enum {
 	FACTORY_MODE_DISABLE,
 	BATT_FULL_CAPACITY,
 };
+
 
 enum {
 	EXT_DEV_NONE = 0,

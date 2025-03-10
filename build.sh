@@ -134,7 +134,7 @@ CLANG_CLEAN() {
 }
 
 TOOLCHAIN() {
-	if [ -e "toolchain/bin/clang-14" ]; then
+	if [ ! -e "toolchain/bin/clang-14" ]; then
 		{
 			echo " "
 			echo " ${GREEN}Using Clang 14 as compiler ${STD}"
@@ -143,7 +143,7 @@ TOOLCHAIN() {
 			GCC_ARM32_FILE=arm-linux-gnueabi-
 			echo " "
 		}
-	elif [ -e "toolchain/bin/clang-13" ]; then
+	elif [ ! -e "toolchain/bin/clang-13" ]; then
 		{
 			echo " "
 			echo " ${GREEN}Using Clang 13 as compiler ${STD}"
@@ -158,8 +158,8 @@ TOOLCHAIN() {
 			echo " ${RED}WARNING: Correct toolchain could not be found! Downloading latest Clang 14 toolchain. ${STD}"
 			echo " "
 			rm -rf toolchain
-        	        #git clone --depth=1 https://github.com/kdrag0n/proton-clang.git toolchain/
-			git clone --depth=1 https://github.com/vijaymalav564/vortex-clang.git toolchain/
+        	git clone --depth=1 https://github.com/kdrag0n/proton-clang.git toolchain/
+			#git clone --depth=1 https://github.com/vijaymalav564/vortex-clang.git toolchain/
 			sleep 1
 		}
 	fi
@@ -672,18 +672,18 @@ BUILD_ALL() {
 		DTB_GENERATOR 1 0
 	fi
 	clear
-	SM_A105X
-	COMMON_STEPS
-	SM_A205X
-	COMMON_STEPS
-	SM_A202X
-	COMMON_STEPS
-	SM_A305X
-	COMMON_STEPS
+	#SM_A105X
+	#COMMON_STEPS
+	#SM_A205X
+	#COMMON_STEPS
+	#SM_A202X
+	#COMMON_STEPS
+	#SM_A305X
+	#COMMON_STEPS
 	SM_A307X
 	COMMON_STEPS
-	SM_A405X
-	COMMON_STEPS
+	#SM_A405X
+	#COMMON_STEPS
 	rm -rf kernel_zip/aroma/dtb/aosp/enf/default
 	rm -rf kernel_zip/aroma/dtb/aosp/perm/default
 	if [ -e "arch/arm64/boot/dts/exynos/dtb/exynos7885.dts.bak" ]; then
@@ -738,14 +738,14 @@ OS_MENU() {
 	# Give the choice to choose Android Version
 	echo " ${ON_BLUE}Android Versions Available: ${STD}"
 
-	if [ "${BUILD_NO}" == "1" ]; then
+	if [ "${BUILD_NO}" == "2" ]; then
 		ANDROID_VAR="AOSP Android 11/12 (R vendor)"
 		ANDROID=r
 		AND_VER=11
 		ONEUI3=1
 		echo " "
 		echo "${GREEN} $ANDROID_VAR chosen as Android Major Version ${STD}"
-	elif [ "${BUILD_NO}" == "2" ]; then
+	elif [ "${BUILD_NO}" == "1" ]; then
 		ANDROID_VAR="Android 11 (OneUI 3)"
 		ANDROID=r
 		AND_VER=11

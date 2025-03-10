@@ -1892,8 +1892,7 @@ static inline void xs_reclassify_socket6(struct socket *sock)
 
 static inline void xs_reclassify_socket(int family, struct socket *sock)
 {
-	WARN_ON_ONCE(sock_owned_by_user(sock->sk));
-	if (sock_owned_by_user(sock->sk))
+	if (WARN_ON_ONCE(!sock_allow_reclassification(sock->sk)))
 		return;
 
 	switch (family) {
@@ -3229,4 +3228,3 @@ module_param_named(tcp_max_slot_table_entries, xprt_max_tcp_slot_table_entries,
 		   max_slot_table_size, 0644);
 module_param_named(udp_slot_table_entries, xprt_udp_slot_table_entries,
 		   slot_table_size, 0644);
-

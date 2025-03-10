@@ -50,22 +50,9 @@ split_boot;
 ui_print "- Installing donut kernel";
 flash_boot;
 
-ui_print " ";
-ui_print "- Installing/updating DTB";
-ui_print " ";
-flash_dtb;
-
-ui_print "- Installing/updating DTBO";
-ui_print " ";
-flash_dtbo;
-
 ## Copy additional files to internal storage
-cp /tmp/anykernel/tools/espectrum.zip /data/media/0/enable_spectrum_support.zip;
-chmod 755 /data/media/0/enable_spectrum_support.zip;
-
-## Copy changelog to internal storage
-cp /tmp/anykernel/tools/changelog.txt /data/media/0/changelog.txt;
-chmod 755 /data/media/0/changelog.txt;
+cp /tmp/anykernel/tools/htweaks.zip /data/media/0/Hiyorix_Tweaks.zip;
+chmod 755 /data/media/0/Hiyorix_Tweaks.zip;
 
 ui_print "- Installation finished successfully!";
 ui_print " ";
@@ -73,7 +60,7 @@ ui_print " ";
 ui_print "- Thank you for using donut kernel!";
 ui_print " ";
 
-ui_print "- Flash enable_spectrum_support.zip found on your internal storage to enable/update latest spectrum support.";
+ui_print "- Flash Hiyorix_Tweaks.zip found on your internal storage for maximum performance.";
 ui_print " ";
 
 ## end install

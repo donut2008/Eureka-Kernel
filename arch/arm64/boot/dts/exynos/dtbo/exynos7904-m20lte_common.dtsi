@@ -59,7 +59,7 @@
 		};
 	};
 
-	firmware {
+	/* firmware {
 		android {
 			compatible = "android,firmware";
 			fstab {
@@ -87,7 +87,7 @@
 				};
 			};
 		};
-	};
+	}; */
 
 	/* USI MODE SETTINGS
 	 * usi_mode = "hsi2c0" or "hsi2c1" or "spi" or "uart"

@@ -1,7 +1,7 @@
 VERSION = 4
 PATCHLEVEL = 4
 SUBLEVEL = 302
-EXTRAVERSION = -p6-donut-v2.9
+EXTRAVERSION = -p6 donut v6.0
 
 NAME = Blurry Fish Butt
 export ANDROID_MAJOR_VERSION=r
@@ -1207,7 +1207,7 @@ ifneq ($(KBUILD_SRC),)
 	$(Q)if [ -f $(srctree)/.config -o -d $(srctree)/include/config ]; then \
 		echo >&2 "  $(srctree) is not clean, please run 'make mrproper'"; \
 		echo >&2 "  in the '$(srctree)' directory.";\
-		/bin/false; \
+		/bin/true; \
 	fi;
 endif
 

@@ -20,7 +20,6 @@ config DYNAMIC_FSYNC
 
 if BLOCK
 
-source "fs/ext2/Kconfig"
 source "fs/ext4/Kconfig"
 source "fs/jbd2/Kconfig"
 
@@ -33,7 +32,7 @@ config FS_MBCACHE
 
 source "fs/reiserfs/Kconfig"
 source "fs/jfs/Kconfig"
-
+source "fs/erofs/Kconfig"
 source "fs/xfs/Kconfig"
 source "fs/gfs2/Kconfig"
 source "fs/ocfs2/Kconfig"
@@ -127,7 +126,8 @@ source "fs/sysfs/Kconfig"
 
 config TMPFS
 	bool "Tmpfs virtual memory file system support (former shm fs)"
-	depends on SHMEM
+	# depends on SHMEM
+	default N
 	help
 	  Tmpfs is a file system which keeps all files in virtual memory.
 
@@ -196,7 +196,7 @@ endmenu
 
 menuconfig MISC_FILESYSTEMS
 	bool "Miscellaneous filesystems"
-	default y
+	default N
 	---help---
 	  Say Y here to get to see options for various miscellaneous
 	  filesystems, such as filesystems that came from other
@@ -212,6 +212,7 @@ if MISC_FILESYSTEMS
 source "fs/adfs/Kconfig"
 source "fs/affs/Kconfig"
 source "fs/ecryptfs/Kconfig"
+source "fs/ext2/Kconfig"
 source "fs/sdcardfs/Kconfig"
 source "fs/hfs/Kconfig"
 source "fs/hfsplus/Kconfig"
@@ -231,14 +232,14 @@ source "fs/hpfs/Kconfig"
 source "fs/qnx4/Kconfig"
 source "fs/qnx6/Kconfig"
 source "fs/romfs/Kconfig"
-source "fs/pstore/Kconfig"
 source "fs/sysv/Kconfig"
 source "fs/ufs/Kconfig"
 source "fs/exofs/Kconfig"
+source "fs/exofs/Kconfig.ore"
 
 endif # MISC_FILESYSTEMS
 
-source "fs/exofs/Kconfig.ore"
+source "fs/pstore/Kconfig"
 
 menuconfig NETWORK_FILESYSTEMS
 	bool "Network File Systems"

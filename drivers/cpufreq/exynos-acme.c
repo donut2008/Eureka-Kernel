@@ -1222,12 +1222,12 @@ static __init int init_domain(struct exynos_cpufreq_domain *domain,
         if (domain->id == 0)
         {
                 domain->boot_freq = 1690000;
-                domain->resume_freq = 1144000;
+                domain->resume_freq = 1482000;
         }
         else if (domain->id == 1)
         {
                 domain->boot_freq = 2080000;
-                domain->resume_freq = 1560000;
+                domain->resume_freq = 1976000;
         }
 #endif
 

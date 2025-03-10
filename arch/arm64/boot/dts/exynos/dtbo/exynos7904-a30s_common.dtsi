@@ -36,7 +36,7 @@
 				};
 			};
 
-			firmware {
+			/* firmware {
 				android {
 					compatible = "android,firmware";
 					vbmeta {
@@ -61,7 +61,7 @@
 						};
 					};
 				};
-			};
+			}; */
 
 			but_zones: but_zones {
 				#list-but-cells = <3>;

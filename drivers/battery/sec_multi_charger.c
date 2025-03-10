@@ -21,7 +21,7 @@ static bool sec_multi_chg_check_sub_charging(struct sec_multi_charger_info *char
 	union power_supply_propval value;
 
 	if (!charger->pdata->sub_charger_condition) {
-		pr_info("%s: sub charger off(default)\n", __func__);
+		pr_debug("%s: sub charger off(default)\n", __func__);
 		return false;
 	}
 
@@ -29,7 +29,7 @@ static bool sec_multi_chg_check_sub_charging(struct sec_multi_charger_info *char
 		SEC_SUB_CHARGER_CONDITION_CURRENT_MAX) {
 		if (charger->total_current.input_current_limit < charger->pdata->sub_charger_condition_current_max) {
 			if (charger->sub_is_charging)
-				pr_info("%s: sub charger off CURRENT_MAX(%d)\n", __func__,
+				pr_debug("%s: sub charger off CURRENT_MAX(%d)\n", __func__,
 					charger->total_current.input_current_limit);
 			return false;
 		}
@@ -46,7 +46,7 @@ static bool sec_multi_chg_check_sub_charging(struct sec_multi_charger_info *char
 
 		if (i >= charger->pdata->sub_charger_condition_online_size) {
 			if (charger->sub_is_charging)
-				pr_info("%s: sub charger off ONLINE(%d)\n", __func__, i);
+				pr_debug("%s: sub charger off ONLINE(%d)\n", __func__, i);
 			return false;
 		}
 	}
@@ -58,7 +58,7 @@ static bool sec_multi_chg_check_sub_charging(struct sec_multi_charger_info *char
 
 		if (value.intval) {
 			if (charger->sub_is_charging)
-				pr_info("%s: sub charger off CV(%d)\n", __func__, value.intval);
+				pr_debug("%s: sub charger off CV(%d)\n", __func__, value.intval);
 			return false;
 		}
 	}
@@ -70,7 +70,7 @@ static bool sec_multi_chg_check_sub_charging(struct sec_multi_charger_info *char
 
 		if (value.intval < charger->pdata->sub_charger_condition_current_now) {
 			if (charger->sub_is_charging)
-				pr_info("%s: sub charger off CURRENT_NOW(%d)\n", __func__, value.intval);
+				pr_debug("%s: sub charger off CURRENT_NOW(%d)\n", __func__, value.intval);
 			return false;
 		} else if (value.intval < charger->pdata->sub_charger_enable_current_now) {
 			if (!charger->sub_is_charging) {
@@ -103,7 +103,7 @@ static int sec_multi_chg_check_input_current(struct sec_multi_charger_info *char
 		psy_do_property(charger->pdata->main_charger_name, set,
 			POWER_SUPPLY_PROP_CURRENT_MAX, value);
 
-		pr_info("%s: set input current - main(%dmA)\n", __func__, value.intval);
+		pr_debug("%s: set input current - main(%dmA)\n", __func__, value.intval);
 	}
 	if (sub_input_current != charger->sub_current.input_current_limit) {
 		charger->sub_current.input_current_limit = sub_input_current;
@@ -111,7 +111,7 @@ static int sec_multi_chg_check_input_current(struct sec_multi_charger_info *char
 		psy_do_property(charger->pdata->sub_charger_name, set,
 			POWER_SUPPLY_PROP_CURRENT_MAX, value);
 
-		pr_info("%s: set input current - sub(%dmA)\n", __func__, value.intval);
+		pr_debug("%s: set input current - sub(%dmA)\n", __func__, value.intval);
 	}
 
 	return 0;
@@ -146,7 +146,7 @@ static int sec_multi_chg_check_charging_current(struct sec_multi_charger_info *c
 		psy_do_property(charger->pdata->main_charger_name, set,
 			POWER_SUPPLY_PROP_CURRENT_NOW, value);
 
-		pr_info("%s: set charging current - main(%dmA)\n", __func__, value.intval);
+		pr_debug("%s: set charging current - main(%dmA)\n", __func__, value.intval);
 	}
 	if (sub_charging_current != charger->sub_current.fast_charging_current) {
 		charger->sub_current.fast_charging_current = sub_charging_current;
@@ -154,7 +154,7 @@ static int sec_multi_chg_check_charging_current(struct sec_multi_charger_info *c
 		psy_do_property(charger->pdata->sub_charger_name, set,
 			POWER_SUPPLY_PROP_CURRENT_NOW, value);
 
-		pr_info("%s: set charging current - sub(%dmA)\n", __func__, value.intval);
+		pr_debug("%s: set charging current - sub(%dmA)\n", __func__, value.intval);
 	}
 
 	return 0;
@@ -179,7 +179,7 @@ static int sec_multi_chg_check_temp_ctrl(struct charger_temp_control *chg_temp_c
 		level = 100;
 	}
 
-	pr_info("%s: temp(%d), threshold(%d), level(%d)\n",
+	pr_debug("%s: temp(%d), threshold(%d), level(%d)\n",
 		__func__, chg_temp_ctrl->temp, chg_temp_ctrl->threshold, level);
 	return level;
 }
@@ -194,7 +194,7 @@ static int sec_multi_chg_check_temperature(struct sec_multi_charger_info *charge
 
 	if ((charger->cable_type == POWER_SUPPLY_TYPE_BATTERY) ||
 		(charger->status != POWER_SUPPLY_STATUS_CHARGING && charger->status != POWER_SUPPLY_STATUS_FULL))
-		pr_info("%s: skip multi charging routine\n", __func__);
+		pr_debug("%s: skip multi charging routine\n", __func__);
 		return 0;
 
 	if (charger->siop_level >= 100) {
@@ -206,7 +206,7 @@ static int sec_multi_chg_check_temperature(struct sec_multi_charger_info *charge
 			psy_do_property(charger->pdata->main_charger_name, set,
 				POWER_SUPPLY_PROP_CURRENT_NOW, value);
 
-			pr_info("%s: set charging current - main(%dmA)\n", __func__, value.intval);
+			pr_debug("%s: set charging current - main(%dmA)\n", __func__, value.intval);
 		}
 
 		if (charger->sub_is_charging) {
@@ -218,7 +218,7 @@ static int sec_multi_chg_check_temperature(struct sec_multi_charger_info *charge
 				psy_do_property(charger->pdata->sub_charger_name, set,
 					POWER_SUPPLY_PROP_CURRENT_NOW, value);
 
-				pr_info("%s: set charging current - sub(%dmA)\n", __func__, value.intval);
+				pr_debug("%s: set charging current - sub(%dmA)\n", __func__, value.intval);
 			}
 		}
 	} else {
@@ -242,7 +242,7 @@ static int sec_multi_chg_check_current(struct sec_multi_charger_info *charger)
 	if ((charger->cable_type == POWER_SUPPLY_TYPE_BATTERY) ||
 		(charger->status == POWER_SUPPLY_STATUS_DISCHARGING) ||
 		charger->chg_mode != SEC_BAT_CHG_MODE_CHARGING) {
-		pr_info("%s: skip multi charging routine\n", __func__);
+		pr_debug("%s: skip multi charging routine\n", __func__);
 		return 0;
 	}
 
@@ -263,7 +263,7 @@ static int sec_multi_chg_check_current(struct sec_multi_charger_info *charger)
 		psy_do_property(charger->pdata->sub_charger_name, set,
 			POWER_SUPPLY_PROP_CHARGING_ENABLED, value);
 
-		pr_info("%s: change sub_is_charging(%d)\n", __func__, charger->sub_is_charging);
+		pr_debug("%s: change sub_is_charging(%d)\n", __func__, charger->sub_is_charging);
 	}
 	return 0;
 }
@@ -491,7 +491,7 @@ static int sec_multi_charger_parse_dt(struct device *dev,
 				pdata->sub_charger_condition_online_size = 0;
 			}
 
-			pr_info("%s: sub_charger_condition(0x%x)\n", __func__, pdata->sub_charger_condition);
+			pr_debug("%s: sub_charger_condition(0x%x)\n", __func__, pdata->sub_charger_condition);
 		}
 
 		ret = of_property_read_u32(np, "charger,main_charger_temp_threshold",
@@ -671,7 +671,7 @@ static struct platform_driver sec_multi_charger_driver = {
 
 static int __init sec_multi_charger_init(void)
 {
-	pr_info("%s: \n", __func__);
+	pr_debug("%s: \n", __func__);
 	return platform_driver_register(&sec_multi_charger_driver);
 }
 

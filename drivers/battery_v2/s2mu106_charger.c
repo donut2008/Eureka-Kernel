@@ -40,7 +40,7 @@
 
 #define IVR_WORK_DELAY 50
 
-#define USB_FAST_CHARGE_SPEED 1200000 // 1200mA
+#define USB_FAST_CHARGE_SPEED 3000000 // 3000mA
 
 static char *s2mu106_supplied_to[] = {
 	"battery",

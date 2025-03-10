@@ -813,10 +813,10 @@ static inline void bpf_flush_icache(void *start, void *end)
 	flush_icache_range((unsigned long)start, (unsigned long)end);
 }
 
-void bpf_jit_compile(struct bpf_prog *prog)
+/* void bpf_jit_compile(struct bpf_prog *prog)
 {
-	/* Nothing to do here. We support Internal BPF. */
-}
+	 Nothing to do here.
+} */
 
 struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 {
@@ -906,6 +906,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 	set_memory_ro((unsigned long)header, header->pages);
 	prog->bpf_func = (void *)ctx.image;
 	prog->jited = 1;
+	prog->jited_len = image_size;
 
 out_off:
 	kfree(ctx.offset);
@@ -916,7 +917,7 @@ out:
 	return prog;
 }
 
-void bpf_jit_free(struct bpf_prog *prog)
+/* void bpf_jit_free(struct bpf_prog *prog)
 {
 	unsigned long addr = (unsigned long)prog->bpf_func & PAGE_MASK;
 	struct bpf_binary_header *header = (void *)addr;
@@ -929,7 +930,7 @@ void bpf_jit_free(struct bpf_prog *prog)
 
 free_filter:
 	bpf_prog_unlock_free(prog);
-}
+} */
 
 #ifdef CONFIG_CFI_CLANG
 bool arch_bpf_jit_check_func(const struct bpf_prog *prog)
