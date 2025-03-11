@@ -5,3 +5,4 @@ patches/*
 arch/arm64/configs/merge.config
 *.log
 *.zip
+.vscode
