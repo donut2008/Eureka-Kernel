@@ -6,3 +6,5 @@ arch/arm64/configs/merge.config
 *.log
 *.zip
 .vscode
+drivers/*bak
+*.bak
