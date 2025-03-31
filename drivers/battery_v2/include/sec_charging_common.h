@@ -70,6 +70,7 @@ enum power_supply_ext_property {
 	POWER_SUPPLY_EXT_PROP_HV_DISABLE,
 	POWER_SUPPLY_EXT_PROP_WD_QBATTOFF,
 	POWER_SUPPLY_EXT_PROP_SRCCAP,
+	POWER_SUPPLY_EXT_PROP_TTF_FULL_CAPACITY,
 };
 
 enum sec_battery_usb_conf {
@@ -82,10 +83,10 @@ enum sec_battery_usb_conf {
 };
 
 enum sec_battery_rp_curr {
-	RP_CURRENT_RP1 = 500,
-	RP_CURRENT_RP2 = 1500,
+	RP_CURRENT_RP1 = 750,
+	RP_CURRENT_RP2 = 1800,
 	RP_CURRENT_RP3 = 3000,
-	RP_CURRENT_DEFAULT_IN = 1800,
+	RP_CURRENT_DEFAULT_IN = 2000,
 #if defined(CONFIG_SEC_FACTORY)	
 	RP_CURRENT_DEFAULT_OUT = 1500,
 #else
