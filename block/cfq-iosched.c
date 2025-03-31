@@ -34,7 +34,7 @@ static u64 cfq_slice_idle = 0;
 /* IOPP-cfq_rt_idle_only-v1.0.4.4 */
 static int cfq_rt_idle_only = 1;
 static u64 cfq_group_idle = NSEC_PER_SEC / 125;
-static const u64 cfq_target_latency = (u64)NSEC_PER_SEC * 3/10; /* 300 ms */
+static const u64 cfq_target_latency = (u64)NSEC_PER_SEC * 8/100; /* 80 ms */
 static const int cfq_hist_divisor = 4;
 /* IOPP-cfq_max_async_dispatch-v1.0.4.4 */
 static int cfq_max_async_dispatch = 4;
@@ -144,7 +144,7 @@ struct cfq_queue {
 	/* time when first request from queue completed and slice started. */
 	u64 slice_start;
 	u64 slice_end;
-	u64 slice_resid;
+	s64 slice_resid;
 
 	/* pending priority requests */
 	int prio_pending;
@@ -2692,7 +2692,7 @@ __cfq_slice_expired(struct cfq_data *cfqd, struct cfq_queue *cfqq,
 			cfqq->slice_resid = cfq_scaled_cfqq_slice(cfqd, cfqq);
 		else
 			cfqq->slice_resid = cfqq->slice_end - ktime_get_ns();
-		cfq_log_cfqq(cfqd, cfqq, "resid=%llu", cfqq->slice_resid);
+		cfq_log_cfqq(cfqd, cfqq, "resid=%lld", cfqq->slice_resid);
 	}
 
 	cfq_group_served(cfqd, cfqq->cfqg, cfqq);
