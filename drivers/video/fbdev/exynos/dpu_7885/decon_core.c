@@ -441,7 +441,7 @@ int decon_tui_protection(bool tui_en)
 }
 
 /* ---------- FB_BLANK INTERFACE ----------- */
-static int decon_enable(struct decon_device *decon)
+int decon_enable(struct decon_device *decon)
 {
 	struct decon_mode_info psr;
 	struct decon_param p;
@@ -577,7 +577,7 @@ err:
 	return ret;
 }
 
-static int decon_disable(struct decon_device *decon)
+int decon_disable(struct decon_device *decon)
 {
 	struct decon_mode_info psr;
 	int ret = 0;
@@ -684,8 +684,10 @@ static int decon_disable(struct decon_device *decon)
 	decon_runtime_suspend(decon->dev);
 #endif
 	decon->state = DECON_STATE_OFF;
+	decon_info("%s: decon->state is DECON_STATE_OFF\n", __func__);
 #if defined(CONFIG_EXYNOS_DOZE)
 	decon->doze_state = DOZE_STATE_SUSPEND;
+	decon_info("%s: decon->doze_state is DOZE_STATE_SUSPEND\n", __func__);
 #endif
 
 #ifdef CONFIG_EXYNOS_PD
@@ -2158,7 +2160,7 @@ static int decon_ioctl(struct fb_info *info, unsigned int cmd,
 			ret = -EFAULT;
 			break;
 		}
-		ret = decon_set_doze_mode(decon, doze);
+		ret = doze != DOZE_STATE_DOZE_SUSPEND ? decon_set_doze_mode(decon, doze) : 0;
 		if (ret)
 			decon_err("DECON:ERR:%s:failed to set doze mode\n", __func__);
 #endif
