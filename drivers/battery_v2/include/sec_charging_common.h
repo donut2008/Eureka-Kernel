@@ -92,6 +92,7 @@ enum sec_battery_rp_curr {
 #else
 	RP_CURRENT_DEFAULT_OUT = 2350,
 #endif
+};
 
 enum power_supply_ext_health {
 	POWER_SUPPLY_HEALTH_VSYS_OVP = POWER_SUPPLY_HEALTH_MAX,
