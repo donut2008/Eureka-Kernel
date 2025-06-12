@@ -50,10 +50,12 @@ static DEFINE_IDR(zram_index_idr);
 static DEFINE_MUTEX(zram_index_mutex);
 
 static int zram_major;
-#if IS_ENABLED(CONFIG_CRYPTO_ZSTD)
-static const char *default_compressor = "zstd";
-#elif IS_ENABLED(CONFIG_CRYPTO_LZ4)
+#if IS_ENABLED(CONFIG_CRYPTO_LZ4)
 static const char *default_compressor = "lz4";
+#elif IS_ENABLED(CONFIG_CRYPTO_LZO)
+static const char *default_compressor = "lzo";
+#elif IS_ENABLED(CONFIG_CRYPTO_ZSTD)
+static const char *default_compressor = "zstd";
 #elif IS_ENABLED(CONFIG_CRYPTO_LZ4FAST)
 static const char *default_compressor = "lz4fast";
 #else
