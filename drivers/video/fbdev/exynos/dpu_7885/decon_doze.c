@@ -242,14 +242,8 @@ int decon_set_doze_mode(struct decon_device *decon, u32 mode)
 		mode = DECON_PWR_DOZE;
     	return 0;
 	} else if (mode == DECON_PWR_DOZE && decon->state == DECON_STATE_OFF) {
-		
-		struct dsim_device *dsim = container_of(decon->out_sd[0], struct dsim_device, sd);
-		struct lcd_info *lcd = dsim->priv.par;
-
 		decon_info("%s: DECON_PWR_DOZE requested during DECON_STATE_OFF, powering on display\n", __func__);
-
 		decon_enable(decon);
-		doze_displayon();
 		mode = DECON_PWR_DOZE;
 		return 0;
 	}
