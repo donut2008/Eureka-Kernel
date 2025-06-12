@@ -396,7 +396,7 @@ static int s6d7at0b_displayon_late(struct lcd_info *lcd)
 	return ret;
 }
 
-int doze_displayon()
+int doze_displayon(void)
 {
 	struct decon_device *decon = get_decon_drvdata(0);
 	struct dsim_device *dsim = container_of(decon->out_sd[0], struct dsim_device, sd);
