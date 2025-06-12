@@ -22,6 +22,5 @@
 + KernelSU Next
 + Upstream from 4.4.177 to 4.4.302-p6
 + Disabled some debugging/logging stuff
-+ lz4fast is default zram compressor
  
 >------------------------------------------------<
