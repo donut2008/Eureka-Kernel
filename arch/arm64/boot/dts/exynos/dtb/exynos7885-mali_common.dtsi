@@ -26,9 +26,9 @@
 		gpu_pmqos_cpu_cluster_num = <2>;
 		gpu_pmu_status_reg_offset = <0x40A4>;
 		gpu_pmu_status_local_pwr_mask = <0xF>; /*0xF << 0*/
-		gpu_min_clock = <343000>;
-		gpu_dvfs_start_clock = <343000>;
-		gpu_dvfs_bl_config_clock = <343000>;
+		gpu_min_clock = <1001000>;
+		gpu_dvfs_start_clock = <1001000>;
+		gpu_dvfs_bl_config_clock = <1001000>;
 		gpu_default_voltage = <800000>;
 		gpu_cold_minimum_vol = <0>;
 		gpu_voltage_offset_margin = <37500>;
@@ -46,7 +46,7 @@
 		gpu_pmqos_int_disable = <0>;
 		gpu_pmqos_mif_max_clock = <1794000>;
 		gpu_pmqos_mif_max_clock_base = <545000>;
-		gpu_cl_dvfs_start_base = <343000>;
+		gpu_cl_dvfs_start_base = <1001000>;
 		gpu_debug_level = <3>; /*DEBUG(1) INFO(2) WARNING(3) ERROR(4)*/
 		gpu_trace_level = <8>; /*TRACE_ALL*/
 		gpu_mo_min_clock = <676000>;
@@ -59,7 +59,7 @@
 		gpu_set_pmu_duration_reg = <0>; /* only for KC for now*/
 		gpu_set_pmu_duration_val = <0>; /* only for KC for now*/
 		eureka_gpu_max_clock = <1300000>;
-		eureka_gpu_highspeed_clock = <1001000>;
+		eureka_gpu_highspeed_clock = <1200000>;
 		eureka_gpu_highspeed_load = <75>;
 		eureka_gpu_temp_throttling = <1200000 1100000 1001000 845000 676000 343000>;
 	};
