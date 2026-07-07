@@ -6,3 +6,6 @@ arch/arm64/configs/merge.config
 *.log
 *.zip
 *ctags
+AnyKernel3/dtb.img
+AnyKernel3/dtbo.img
+AnyKernel3/Image
