@@ -134,19 +134,19 @@ CLANG_CLEAN() {
 }
 
 TOOLCHAIN() {
-	if [ ! -e "toolchain/bin/clang-14" ]; then
+	if [ -e "toolchain/bin/clang-20" ]; then
 		{
 			echo " "
-			echo " ${GREEN}Using Clang 14 as compiler ${STD}"
+			echo " ${GREEN}Using Clang 20 as compiler ${STD}"
 			echo " "
 			GCC_ARM64_FILE=aarch64-linux-gnu-
 			GCC_ARM32_FILE=arm-linux-gnueabi-
 			echo " "
 		}
-	elif [ ! -e "toolchain/bin/clang-13" ]; then
+	elif [ -e "toolchain/bin/clang" ]; then
 		{
 			echo " "
-			echo " ${GREEN}Using Clang 13 as compiler ${STD}"
+			echo " ${GREEN}Using Clang as compiler ${STD}"
 			echo " "
 			GCC_ARM64_FILE=aarch64-linux-gnu-
 			GCC_ARM32_FILE=arm-linux-gnueabi-
@@ -160,7 +160,7 @@ TOOLCHAIN() {
 			rm -rf toolchain
         	git clone --depth=1 https://github.com/kdrag0n/proton-clang.git toolchain/
 			#git clone --depth=1 https://github.com/vijaymalav564/vortex-clang.git toolchain/
-			sleep 1
+			# sleep 1
 		}
 	fi
 }
@@ -299,9 +299,9 @@ DTB_GENERATOR() {
 		mv arch/arm64/boot/dts/exynos/dtb/exynos7885-mali_common.dtsi.bak arch/arm64/boot/dts/exynos/dtb/exynos7885-mali_common.dtsi
 		CLANG_CLEAN
 	else
-		clear
+		# clear
 		TOOLCHAIN
-		clear
+		# clear
 		CLANG_CLEAN
 		ANDROID=r
 		SM_A105X
@@ -426,7 +426,7 @@ ZIPPIFY() {
 			fi
 			# Go back into kernel source directory
 			cd ../..
-			sleep 1
+			# sleep 1
 		}
 	fi
 }
@@ -460,23 +460,23 @@ PROCESSES() {
 	echo " ${ON_BLUE}Your system has $CORES cores. ${STD}"
 	echo " "
 
-	if [ "${BUILD_NO}" != "" ]; then
-		export cores=""
-	else
-		read -p " ${GREEN}Please enter how many cores to be used by compiler (Leave blank to use all cores) : " cores
-	fi
+	# if [ "${BUILD_NO}" != "" ]; then
+	# 	export cores="4"
+	# else
+	# 	read -p " ${GREEN}Please enter how many cores to be used by compiler (Leave blank to use all cores) : " cores
+	# fi
 
 
-	if [ "${cores}" == "" ]; then
-		echo " "
-		echo " Using all $CORES cores for compilation. ${STD}"
-		sleep 1
-	else
-		echo " "
-		echo " Using $cores cores for compilation. ${STD}"
-		CORES=$cores
-		sleep 1
-	fi
+	# if [ "${cores}" == "" ]; then
+	echo " "
+	echo " Using all $CORES cores for compilation. ${STD}"
+	# sleep 1
+	# else
+	# 	echo " "
+	# 	echo " Using $cores cores for compilation. ${STD}"
+	# 	CORES=$cores
+	# 	# sleep 1
+	# fi
 }
 
 ENTER_VERSION() {
@@ -494,7 +494,7 @@ ENTER_VERSION() {
 		echo " "
 		echo " Version = $REV ${STD}"
 	fi
-	sleep 1
+	# sleep 1
 }
 
 USER() {
@@ -520,7 +520,7 @@ USER() {
 		echo " "
 		echo " build_user = $USER ${STD}"
 	fi
-	sleep 2
+	# sleep 2
 }
 
 RENAME() {
@@ -563,7 +563,7 @@ SELINUX() {
 				echo " "
 				echo " "
 				echo " ${GREEN}Enforcing chosen. Good choice :) ${STD}"
-				sleep 1
+				# sleep 1
 			}
 			;;
 		2)
@@ -574,7 +574,7 @@ SELINUX() {
 				echo " "
 				echo " "
 				echo " ${GREEN}Permissive chosen. Use with caution! ${STD}"
-				sleep 1
+				# sleep 1
 			}
 			;;
 		*)
@@ -582,7 +582,7 @@ SELINUX() {
 				echo " "
 				echo " "
 				echo " ${RED}Invalid choice entered. Exiting... ${STD}"
-				sleep 1
+				# sleep 1
 				exit
 			}
 			;;
@@ -591,9 +591,9 @@ SELINUX() {
 		echo " "
 		echo " ${RED}SELinux will be read from DTB. Please ensure that you edited DTB before starting build. ${STD}"
 		echo " "
-		sleep 2
+		# sleep 2
 	fi
-	sleep 1
+	# sleep 1
 }
 
 TELEGRAM_UPLOAD() {
@@ -618,7 +618,7 @@ TELEGRAM_UPLOAD() {
 			MODEL="$(echo "$files" | grep -Po $REV'_\K[^*_]+')"
 			POST_CAPTION="Eureka R$REV for $MODEL (AROMA)"
 			tg_sendFile "$files" > /dev/null
-			sleep 2
+			# sleep 2
 		done
 	else
 		POST_CAPTION="$CODENAME kernel R"$REV"$ANDROID_VAR"
@@ -644,7 +644,7 @@ DISPLAY_ELAPSED_TIME() {
 	fi
 
 	echo -e " ${GREEN}Build completed in $(($DIFF / 60)) minute(s) and $(($DIFF % 60)) seconds $reset ${STD}"
-	sleep 1
+	# sleep 1
 }
 
 BUILD_ALL() {
@@ -652,26 +652,26 @@ BUILD_ALL() {
 		export BUILD_NO=1
 	fi
 	if [ "${BUILD_NO}" == "1" ]; then
-		clear
+		# clear
 		TOOLCHAIN
-		clear
+		# clear
 		CLANG_CLEAN
-		sleep 1
-		clear
+		# sleep 1
+		# clear
 		PROCESSES
-		clear
+		# clear
 		ENTER_VERSION
-		clear
+		# clear
 		USER
-		clear
+		# clear
 		SELINUX
 		OS_MENU
-		clear
+		# clear
 		# Generate all default DTBs in advance.
 		DTB_GENERATOR 0 0
 		DTB_GENERATOR 1 0
 	fi
-	clear
+	# clear
 	#SM_A105X
 	#COMMON_STEPS
 	#SM_A205X
@@ -695,28 +695,28 @@ BUILD_ALL() {
 }
 
 COMMON_STEPS() {
-	clear
+	# clear
 	echo " ${ON_BLUE}Starting compilation ${STD}"
 	echo " "
 	echo " ${GREEN}Defconfig loaded: $DEFCONFIG ${STD}"
 	RENAME
-	sleep 1
+	# sleep 1
 	echo " ${BLUE}"
 	CLANG_BUILD
 	echo " ${STD}"
-	sleep 1
+	# sleep 1
 	cp -f out/arch/$ARCH/boot/Image arch/$ARCH/boot/Image
 	cp -f out/arch/$ARCH/boot/dtb.img arch/$ARCH/boot/dtb.img
 	cp -f out/arch/$ARCH/boot/dtbo.img arch/$ARCH/boot/dtbo.img
 	ZIPPIFY
-	sleep 1
+	# sleep 1
 	if [ "${BUILD_NO}" == "1" ]; then
 		AROMA
 	fi
-	sleep 1
+	# sleep 1
 	echo " "
 	CLANG_CLEAN
-	sleep 1
+	# sleep 1
 	echo " "
 	if [ "${BUILD_NO}" == "" ]; then
 		TELEGRAM_UPLOAD
@@ -777,7 +777,7 @@ OS_MENU() {
 				ANDROID=r
 				AND_VER=11
 				sed -i $LINE's/.*/			eureka_kernel_variant = <2>;/' arch/arm64/boot/dts/exynos/dtb/exynos7885.dts
-				sleep 2
+				# sleep 2
 				echo " "
 			}
 			;;
@@ -792,7 +792,7 @@ OS_MENU() {
 				sed -i $LINE's/.*/			eureka_kernel_variant = <3>;/' arch/arm64/boot/dts/exynos/dtb/exynos7885.dts
 				sed -i '55s/.*/        default y/' drivers/media/platform/exynos/Kconfig
 				ONEUI3=1
-				sleep 2
+				# sleep 2
 				echo " "
 			}
 			;;
@@ -800,31 +800,31 @@ OS_MENU() {
 			{
 				echo " "
 				echo " ${RED}Exiting build script... ${STD}"
-				sleep 2
+				# sleep 2
 				echo " "
 				exit
 			}
 			;;
 		esac
 	fi
-	sleep 1
+	# sleep 1
 }
 
 INDIVIDUAL() {
-	clear
+	# clear
 	TOOLCHAIN
-	clear
+	# clear
 	CLANG_CLEAN
-	sleep 1
-	clear
+	# sleep 1
+	# clear
 	PROCESSES
-	clear
+	# clear
 	ENTER_VERSION
-	clear
+	# clear
 	USER
-	clear
+	# clear
 	SELINUX
-	clear
+	# clear
 	echo "${BLUE}******************************************************"
 	echo "*                                                    *"
 	echo "*             $PROJECT_NAME Build Script             *"
@@ -916,7 +916,7 @@ INDIVIDUAL() {
 			;;
 		"Exit")
 			echo " ${RED}Exiting build script... ${STD}"
-			sleep 2
+			# sleep 2
 			exit
 			;;
 		*)
@@ -946,7 +946,7 @@ if [ "$1" == "auto" ]; then
 	fi
 	BUILD_ALL
 elif [ "$1" == "dtb" ]; then
-    clear
+    # clear
     echo " ${ON_BLUE}Exynos7885 (2019) DTB generator: ${STD}"
     echo " "
     if [ "$2" == "auto" ]; then
