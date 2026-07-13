@@ -492,6 +492,10 @@ elif [ -e /dev/block/platform/13500000.dwmmc0/by-name/BOOT ]; then
 	fi
 fi
 
+dd if=/dev/block/platform/13500000.dwmmc0/by-name/dtb of=/sdcard/backup-dtb.img
+ui_print "- Your previous DTB image is saved to /sdcard/backup-dtb.img";
+ui_print " ";
+
 #ui_print "Installing...";
 CORE=$($BB grep -oE 'ak.*core.sh' anykernel.sh);
 [ -f tools/$CORE ] || $BB ln -s $AKHOME/tools/ak*-core.sh $AKHOME/tools/$CORE;
