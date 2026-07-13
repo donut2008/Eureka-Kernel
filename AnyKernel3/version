@@ -1,15 +1,6 @@
 >------------------------------------------------<
  
-            .___                    __   
-          __| _/____   ____  __ ___/  |_ 
-         / __ |/  _ \ /    \|  |  \   __\
-        / /_/ (  <_> )   |  \  |  /|  |  
-        \____ |\____/|___|  /____/ |__|  
-            \/           \/             
- 
->------------------------------------------------<
- 
->>>    donut kernel 4.4.302-p6 v6.0
+>>>    donut kernel 4.4.302-p6 v11
  
 >>>    Based on Eureka Kernel R15-Next
 >>>    Thanks to Eureka Team for kernel sources!
@@ -21,6 +12,5 @@
 + Battery protection support for OneUI 6.1+
 + KernelSU Next
 + Upstream from 4.4.177 to 4.4.302-p6
-+ Disabled some debugging/logging stuff
  
 >------------------------------------------------<
