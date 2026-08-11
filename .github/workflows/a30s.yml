@@ -43,7 +43,7 @@ jobs:
       run: |
         wget "$(curl -s https://raw.githubusercontent.com/XSans0/WeebX-Clang/main/main/link.txt)" -O "clang.tar.gz"
         trap 'rm -rf clang.tar.gz' EXIT
-        mkdir -p toolchains/clang && tar -xvf clang.tar.gz -C toolchains/clang
+        mkdir -p toolchain/ && tar -xvf clang.tar.gz -C toolchain/
 
     - name: Make defconfig
       run: |
