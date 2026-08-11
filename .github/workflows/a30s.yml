@@ -48,17 +48,17 @@ jobs:
     - name: Make defconfig
       run: |
         echo "Building defconfig"
-        make O=out ARCH=arm64 LLVM_DIS=llvm-dis AR=llvm-ar NM=llvm-nm LD=ld.lld OBJDUMP=llvm-objdump STRIP=llvm-strip CC=clang LD_LIBRARY_PATH="${{ github.workspace }}/toolchain/lib:$LD_LIBRARY_PATH" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- exynos7885-a30s_oneui_defconfig -j$(nproc)
+        make O=out ARCH=arm64 exynos7885-a30s_defconfig -j$(nproc)
 
     - name: Make kernel
       run: |
         echo "Building kernel"
-        make O=out ARCH=arm64 -j$(nproc) LLVM_DIS=llvm-dis AR=llvm-ar NM=llvm-nm LD=ld.lld OBJDUMP=llvm-objdump STRIP=llvm-strip CC=clang LD_LIBRARY_PATH="${{ github.workspace }}/toolchain/lib:$LD_LIBRARY_PATH" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- Image
+        PATH="${{ github.workspace }}/toolchain/bin:${{ github.workspace }}/toolchain/bin:${PATH}" make -j$(nproc) O=out ARCH=arm64 ANDROID_MAJOR_VERSION=r LLVM_DIS=llvm-dis AR=llvm-ar NM=llvm-nm LD=ld.lld OBJDUMP=llvm-objdump STRIP=llvm-strip CC=clang LD_LIBRARY_PATH="${{ github.workspace }}/toolchain/lib:$LD_LIBRARY_PATH" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- Image
 
     - name: Build DTB
       run: |
         echo "Building DTB"
-        make O=out ARCH=arm64 -j$(nproc) LLVM_DIS=llvm-dis AR=llvm-ar NM=llvm-nm LD=ld.lld OBJDUMP=llvm-objdump STRIP=llvm-strip CC=clang LD_LIBRARY_PATH="${{ github.workspace }}/toolchain/lib:$LD_LIBRARY_PATH" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- dtb.img
+        PATH="${{ github.workspace }}/toolchain/bin:${{ github.workspace }}/toolchain/bin:${PATH}" make -j$(nproc) O=out ARCH=arm64 ANDROID_MAJOR_VERSION=r LLVM_DIS=llvm-dis AR=llvm-ar NM=llvm-nm LD=ld.lld OBJDUMP=llvm-objdump STRIP=llvm-strip CC=clang LD_LIBRARY_PATH="${{ github.workspace }}/toolchain/lib:$LD_LIBRARY_PATH" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- dtb.img
         cp out/arch/arm64/boot/dtb.img AnyKernel3/dtb.img
 
     - name: Zip kernel
